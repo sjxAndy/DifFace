@@ -270,7 +270,7 @@ class TrainerBase:
         pass
 
     def adjust_lr(self, current_iters=None):
-        assert hasattr(self, 'lr_sheduler'):
+        assert hasattr(self, 'lr_sheduler')
         self.lr_sheduler.step()
 
     def save_ckpt(self):
@@ -859,6 +859,419 @@ class TrainerDiffusionFace(TrainerBase):
     def reload_ema_model(self, rate):
         model_state = {key[7:]:value for key, value in self.ema_state[f"0{int(rate*1000)}"].items()}
         self.ema_model.load_state_dict(model_state)
+
+
+
+class TrainerDegradation(TrainerBase):
+    def __init__(self, configs):
+        # ema settings
+        self.ema_rates = OmegaConf.to_object(configs.train.ema_rates)
+        self.schedule_phase = None
+        super().__init__(configs)
+
+    def setup_dist(self):
+        if self.configs.gpu_id:
+            gpu_id = self.configs.gpu_id
+            num_gpus = len(gpu_id)
+            os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+            os.environ['CUDA_VISIBLE_DEVICES'] = ','.join([gpu_id[ii] for ii in range(num_gpus)])
+        else:
+            num_gpus = torch.cuda.device_count()
+
+        # if num_gpus > 1:
+        #     if mp.get_start_method(allow_none=True) is None:
+        #         mp.set_start_method('spawn')
+        #     rank = int(os.environ['LOCAL_RANK'])
+        #     torch.cuda.set_device(rank % num_gpus)
+        #     dist.init_process_group(
+        #             backend='nccl',
+        #             init_method='env://',
+        #             )
+
+        self.num_gpus = num_gpus
+        self.rank = int(os.environ['LOCAL_RANK']) if num_gpus > 1 else 0
+
+    def init_logger(self):
+        super().init_logger()
+
+        save_dir = Path(self.configs.save_dir)
+        ema_ckpt_dir = save_dir / 'ema_ckpts'
+        if self.rank == 0:
+            if not ema_ckpt_dir.exists():
+                util_common.mkdir(ema_ckpt_dir, delete=False, parents=False)
+            else:
+                if not self.configs.resume:
+                    util_common.mkdir(ema_ckpt_dir, delete=True, parents=False)
+
+        self.ema_ckpt_dir = ema_ckpt_dir
+
+    def resume_from_ckpt(self):
+        # if self.configs.resume:
+        #     if type(self.configs.resume) == bool:
+        #         ckpt_index = max([int(x.stem.split('_')[1]) for x in Path(self.ckpt_dir).glob('*.pth')])
+        #         ckpt_path = str(Path(self.ckpt_dir) / f"model_{ckpt_index}.pth")
+        #     else:
+        #         ckpt_path = self.configs.resume
+        #     assert os.path.isfile(ckpt_path)
+        #     if self.rank == 0:
+        #         self.logger.info(f"=> Loaded checkpoint {ckpt_path}")
+        #     ckpt = torch.load(ckpt_path, map_location=f"cuda:{self.rank}")
+        #     util_net.reload_model(self.model, ckpt['state_dict'])
+        #     torch.cuda.empty_cache()
+
+        #     # iterations
+        #     self.iters_start = ckpt['iters_start']
+        #     # learning rate scheduler
+        #     for ii in range(self.iters_start):
+        #         self.adjust_lr(ii)
+        #     if self.rank == 0:
+        #         self.log_step = ckpt['log_step']
+        #         self.log_step_img = ckpt['log_step_img']
+
+        #     # reset the seed
+        #     self.setup_seed(self.iters_start)
+        # else:
+        #     self.iters_start = 0
+
+
+        load_path = self.configs['path']['resume_state']
+        if load_path is not None:
+            if self.rank == 0:
+                self.logger.info(
+                    'Loading pretrained model for G [{:s}] ...'.format(load_path))
+            gen_path = '{}_gen.pth'.format(load_path)
+            opt_path = '{}_opt.pth'.format(load_path)
+
+            ckpt = torch.load(gen_path, map_location=f"cuda:{self.rank}")
+            # ckpt = torch.load(gen_path, map_location=f"cuda:{self.rank}", strict=(not self.configs.model['params']['finetune_norm']))
+            util_net.reload_model(self.model, ckpt['state_dict'])
+            torch.cuda.empty_cache()
+            self.iters_start = ckpt['iters_start']
+            # if self.rank == 0:
+            #     self.log_step = ckpt['log_step']
+            #     self.log_step_img = ckpt['log_step_img']
+
+            self.setup_seed(self.iters_start)
+
+            # print(torch.cuda.memory_allocated() / 1024/1024)
+            if self.configs['phase'] == 'train':
+                # optimizer
+                opt = torch.load(opt_path, map_location=f"cuda:{self.rank}")
+                self.optimizer.load_state_dict(opt['optimizer'])
+                torch.cuda.empty_cache()
+                # self.begin_step = opt['iter']
+                # self.begin_epoch = opt['epoch']
+        else:
+            self.iters_start = 0
+        # super().resume_from_ckpt()
+
+        # def _load_ema_state(ema_state, ckpt):
+        #     for key in ema_state.keys():
+        #         ema_state[key] = deepcopy(ckpt[key].detach().data)
+
+        # if self.configs.resume:
+        #     # ema model
+        #     if type(self.configs.resume) == bool:
+        #         ckpt_index = max([int(x.stem.split('_')[1]) for x in Path(self.ckpt_dir).glob('*.pth')])
+        #         ckpt_path = str(Path(self.ckpt_dir) / f"model_{ckpt_index}.pth")
+        #     else:
+        #         ckpt_path = self.configs.resume
+        #     assert os.path.isfile(ckpt_path)
+        #     # EMA model
+        #     for rate in self.ema_rates:
+        #         ema_ckpt_path = self.ema_ckpt_dir / (f"ema0{int(rate*1000)}_"+Path(ckpt_path).name)
+        #         ema_ckpt = torch.load(ema_ckpt_path, map_location=f"cuda:{self.rank}")
+        #         _load_ema_state(self.ema_state[f"0{int(rate*1000)}"], ema_ckpt)
+
+    def build_model(self):
+        import models.networks as networks
+        params = self.configs.model.get('params', dict)
+        opt = self.configs.model.get('params', dict)
+        model = networks.define_G(opt)
+
+        self.begin_step = 0
+        self.begin_epoch = 0
+
+        self.ema_model = deepcopy(model.cuda())
+        if self.num_gpus > 1:
+            self.model = DDP(model.cuda(), device_ids=[self.rank,])  # wrap the network
+        else:
+            self.model = model.cuda()
+        # networks.init_weights(self.model, init_type='orthogonal')
+        
+        self.ema_state = {}
+        for rate in self.ema_rates:
+            self.ema_state[f"0{int(rate*1000)}"] = OrderedDict(
+                {key:deepcopy(value.data) for key, value in self.model.state_dict().items()}
+                )
+        self.set_new_noise_schedule(
+            self.configs['model']['params']['beta_schedule'][self.configs['phase']], schedule_phase=self.configs['phase'])
+        # model information
+        self.print_model_info()
+
+        # params = self.configs.diffusion.get('params', dict)
+        # self.base_diffusion = util_common.get_obj_from_str(self.configs.diffusion.target)(**params)
+        # self.sample_scheduler_diffusion = UniformSampler(self.base_diffusion.num_timesteps)
+
+    def setup_optimizaton(self):
+        # self.optimizer = torch.optim.AdamW(self.model.parameters(),
+        #                                    lr=self.configs.train.lr,
+        #                                    weight_decay=self.configs.train.weight_decay)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=self.configs['train']["optimizer"]["lr"])
+    
+    def build_dataloader(self):
+        super().build_dataloader()
+        if self.rank == 0 and 'val' in self.configs.data:
+            dataset_config = self.configs.data.get('val', dict)
+            self.datasets['val'] = create_dataset(dataset_config)
+            self.dataloaders['val'] = udata.DataLoader(
+                    self.datasets['val'],
+                    batch_size=self.configs.train.batch[1],
+                    shuffle=False,
+                    drop_last=False,
+                    num_workers=0,
+                    pin_memory=True,
+                    )
+    
+    def set_new_noise_schedule(self, schedule_opt, schedule_phase='train'):
+        if self.schedule_phase is None or self.schedule_phase != schedule_phase:
+            self.schedule_phase = schedule_phase
+            if isinstance(self.model, nn.parallel.DistributedDataParallel):
+                self.model.module.set_new_noise_schedule(schedule_opt, device=f"cuda:{self.rank}")
+            else:
+                self.model.set_new_noise_schedule(schedule_opt, device=f"cuda:{self.rank}")
+
+    def train(self):
+        self.build_dataloader() # prepare data: self.dataloaders, self.datasets, self.sampler
+
+        self.model.train()
+
+        # Train
+        # current_step = self.begin_step
+        # current_epoch = self.begin_epoch
+        # n_iter = self.configs['train']['n_iter']
+
+        if self.configs['path']['resume_state']:
+            if self.rank == 0:
+                self.logger.info('Resuming training from iter: {}.'.format(self.iters_start))
+        if isinstance(self.model, nn.parallel.DistributedDataParallel):
+            self.model.module.set_loss(device=f"cuda:{self.rank}")
+        else:
+            self.model.set_loss(device=f"cuda:{self.rank}")
+
+        self.set_new_noise_schedule(
+            self.configs['model']['params']['beta_schedule'][self.configs['phase']], schedule_phase=self.configs['phase'])
+        if self.configs['phase'] == 'train':
+            num_iters_epoch = math.ceil(len(self.datasets['train']) / self.configs.train.batch[0])
+
+            for ii in range(self.iters_start, self.configs.train.iterations):
+                self.current_iters = ii + 1
+                # print(self.current_iters, torch.cuda.memory_allocated()/1024/1024)
+
+                # prepare data
+                data = self.prepare_data(next(self.dataloaders['train']))
+
+                # training phase
+                self.training_step(data)
+                torch.cuda.empty_cache()
+
+                # validation phase
+                if (ii+1) % self.configs.train['val_freq'] == 0 and 'val' in self.dataloaders:
+                    if self.rank==0:
+                        self.validation()
+
+                #update learning rate
+                # self.adjust_lr()
+
+                # save checkpoint
+                if (ii+1) % self.configs.train['save_checkpoint_freq'] == 0 and self.rank == 0:
+                    self.save_ckpt()
+
+                if (ii+1) % num_iters_epoch == 0 and not self.sampler is None:
+                    self.sampler.set_epoch(ii+1)
+
+            # close the tensorboard
+            if self.rank == 0:
+                self.close_logger()
+            
+    
+    def prepare_data(self, data, realesrgan=False):
+        data = {key:value.cuda() for key, value in data.items()}
+        return data
+
+    def training_step(self, data):
+        current_batchsize = data['HQ'].shape[0]
+        micro_batchsize = self.configs.train.microbatch
+        num_grad_accumulate = math.ceil(current_batchsize / micro_batchsize)
+
+        if self.configs.train.use_fp16:
+            scaler = amp.GradScaler()
+
+        self.optimizer.zero_grad()
+        for jj in range(0, current_batchsize, micro_batchsize):
+            losses = {}
+            micro_data = {key:value[jj:jj+micro_batchsize,] for key, value in data.items()}
+            last_batch = (jj+micro_batchsize >= current_batchsize)
+            # print('micro data size', micro_data['HQ'].shape)
+            # print('micro:', torch.cuda.memory_allocated())
+
+            # self.model.zero_grad()
+            l_pix = self.model(micro_data)
+            # need to average in multi-gpu
+            b, c, h, w = micro_data['HQ'].shape
+            l_pix = l_pix.sum() / int(b * c * h * w) / num_grad_accumulate
+            l_pix.backward()
+            losses['l_pix'] = l_pix.item()
+            # self.optimizer.step()
+
+            # set log
+            # self.log_dict['l_pix'] = l_pix.item()
+
+            self.log_step_train(losses, micro_data, last_batch)
+
+        if self.configs.train.use_fp16:
+            scaler.step(self.optimizer)
+            scaler.update()
+        else:
+            self.optimizer.step()
+
+        # self.update_ema_model()
+
+    def update_ema_model(self):
+        if self.num_gpus > 1:
+            dist.barrier()
+        if self.rank == 0:
+            for rate in self.ema_rates:
+                ema_state = self.ema_state[f"0{int(rate*1000)}"]
+                source_state = self.model.state_dict()
+                for key, value in ema_state.items():
+                    ema_state[key].mul_(rate).add_(source_state[key].detach().data, alpha=1-rate)
+
+    def adjust_lr(self, current_iters=None):
+        base_lr = self.configs.train.lr
+        linear_steps = self.configs.train.milestones[0]
+        current_iters = self.current_iters if current_iters is None else current_iters
+        if current_iters <= linear_steps:
+            for params_group in self.optimizer.param_groups:
+                params_group['lr'] = (current_iters / linear_steps) * base_lr
+        elif current_iters in self.configs.train.milestones:
+            for params_group in self.optimizer.param_groups:
+                params_group['lr'] *= 0.5
+
+    def log_step_train(self, loss, batch, flag=False, phase='train'):
+        '''
+        param loss: a dict recording the loss informations
+        '''
+        if self.rank == 0:
+            if self.current_iters % self.configs['train']['print_freq'] == 0 and flag:
+                message = '<iter:{:8,d}> '.format(
+                    self.current_iters)
+                for k, v in loss.items():
+                    message += '{:s}: {:.4e} '.format(k, v)
+                    self.writer.add_scalar(k, v, self.current_iters)
+                self.logger.info(message)
+        
+        # if self.rank == 0:
+            # if self.current_iters % self.configs.train.save_freq == 1 and flag:
+            #     self.tic = time.time()
+            # if self.current_iters % self.configs.train.save_freq == 0 and flag:
+            #     self.toc = time.time()
+            #     elaplsed = (self.toc - self.tic) * num_timesteps  / (num_timesteps - 1)
+            #     self.logger.info(f"Elapsed time: {elaplsed:.2f}s")
+            #     self.logger.info("="*130)
+
+    def validation(self, phase='val'):
+        import utils.metrics as Metrics
+        avg_psnr = 0.0
+        idx = 0
+        result_path = '{}/{}'.format(self.configs['path']
+                                    ['results'], self.current_iters)
+        os.makedirs(result_path, exist_ok=True)
+
+        self.set_new_noise_schedule(
+            self.configs['model']['params']['beta_schedule']['val'], schedule_phase='val')
+        for _,  val_data in enumerate(self.dataloaders['val']):
+            idx += 1
+            data = self.prepare_data(val_data)
+            self.model.eval()
+            with torch.no_grad():
+                if isinstance(self.model, nn.parallel.DistributedDataParallel):
+                    HQ = self.model.module.super_resolution(val_data['LQ'], False)
+                else:
+                    HQ = self.model.super_resolution(val_data['LQ'], False)
+            self.model.train()
+
+            # visuals = diffusion.get_current_visuals()
+
+            out_dict = OrderedDict()
+            need_LR = True
+            sample = False
+            if sample:
+                out_dict['SAM'] = HQ.detach().float().cpu()
+            else:
+                out_dict['HQ'] = HQ.detach().float().cpu()
+                out_dict['LQ'] = val_data['LQ'].detach().float().cpu()
+                out_dict['GT'] = val_data['HQ'].detach().float().cpu()
+                # if need_LR and 'LR' in self.data:
+                #     out_dict['LR'] = self.data['LR'].detach().float().cpu()
+                # else:
+                #     out_dict['LR'] = out_dict['INF']
+            visuals = out_dict
+            lq_img = Metrics.tensor2img(visuals['LQ'])  # uint8
+            hq_img = Metrics.tensor2img(visuals['HQ'])  # uint8
+            gt_img = Metrics.tensor2img(visuals['GT'])  # uint8
+
+            # generation
+            Metrics.save_img(
+                hq_img, '{}/{}_{}_hq.png'.format(result_path, self.current_iters, idx))
+            Metrics.save_img(
+                lq_img, '{}/{}_{}_lq.png'.format(result_path, self.current_iters, idx))
+            Metrics.save_img(
+                gt_img, '{}/{}_{}_gt.png'.format(result_path, self.current_iters, idx))
+            self.writer.add_image('Iter_{}'.format(self.current_iters), np.transpose(np.concatenate((lq_img, hq_img, gt_img), axis=1), [2, 0, 1]), idx)
+            avg_psnr += Metrics.calculate_psnr(hq_img, gt_img)
+
+        avg_psnr = avg_psnr / idx
+        self.set_new_noise_schedule(
+            self.configs['model']['params']['beta_schedule']['train'], schedule_phase='train')
+        # log
+        self.logger.info('# Validation # PSNR: {:.4e}'.format(avg_psnr))
+        self.writer.add_scalar(f'psnr', avg_psnr, self.current_iters)
+
+    def save_ckpt(self):
+        if self.rank == 0:
+            # gen_path = os.path.join(
+            #     self.configs['path']['checkpoint'], 'model_{}_gen.pth'.format(self.current_iters))
+            # opt_path = os.path.join(
+            #     self.configs['path']['checkpoint'], 'model_{}_opt.pth'.format(self.current_iters))
+            gen_path = self.ckpt_dir / 'model_{:d}_gen.pth'.format(self.current_iters)
+            opt_path = self.ckpt_dir / 'model_{:d}_opt.pth'.format(self.current_iters)
+
+            torch.save({'iters_start': self.current_iters,
+                        # 'log_step': {phase:self.log_step[phase] for phase in ['train', 'val']},
+                        # 'log_step_img': {phase:self.log_step_img[phase] for phase in ['train', 'val']},
+                        'state_dict': self.model.state_dict()}, gen_path)
+            for rate in self.ema_rates:
+                ema_ckpt_path = self.ema_ckpt_dir / (f"ema0{int(rate*1000)}_"+gen_path.name)
+                torch.save(self.ema_state[f"0{int(rate*1000)}"], ema_ckpt_path)
+
+            opt_state = {'scheduler': None, 'optimizer': None}
+            opt_state['optimizer'] = self.optimizer.state_dict()
+            torch.save(opt_state, opt_path)
+            # self.logger.info(
+            #     'Saved model in [{:s}] ...'.format(gen_path))
+
+    def calculate_lpips(self, inputs, targets):
+        inputs, targets = [(x-0.5)/0.5 for x in [inputs, targets]] # [-1, 1]
+        with torch.no_grad():
+            mean_lpips = self.lpips_loss(inputs, targets)
+        return mean_lpips.mean().item()
+
+    def reload_ema_model(self, rate):
+        model_state = {key[7:]:value for key, value in self.ema_state[f"0{int(rate*1000)}"].items()}
+        self.ema_model.load_state_dict(model_state)
+
 
 def my_worker_init_fn(worker_id):
     np.random.seed(np.random.get_state()[1][0] + worker_id)

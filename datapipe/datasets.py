@@ -14,6 +14,8 @@ from utils import util_common
 
 from basicsr.data.realesrgan_dataset import RealESRGANDataset
 from .ffhq_degradation_dataset import FFHQDegradationDataset
+from .LQHQ_dataset import LQHQDataset
+from .LQHQ_nor_dataset import LQHQNorDataset
 
 def get_transforms(transform_type, out_size, sf):
     if transform_type == 'default':
@@ -48,6 +50,10 @@ def create_dataset(dataset_config):
         dataset = BaseDataFolder(**dataset_config['params'])
     elif dataset_config['type'] == 'realesrgan':
         dataset = RealESRGANDataset(dataset_config['params'])
+    elif dataset_config['type'] == 'lqhq':
+        dataset = LQHQDataset(dataset_config['params'])
+    elif dataset_config['type'] == 'lqhqnor':
+        dataset = LQHQNorDataset(dataset_config['params'])
     else:
         raise NotImplementedError(dataset_config['type'])
 

@@ -89,7 +89,8 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
             img_np = (img_np * 255.0).round()
         img_np = img_np.astype(out_type)
         result.append(img_np)
-    if len(result) == 1 and torch.is_tensor(tensor):
+    # if len(result) == 1 and torch.is_tensor(tensor):
+    if len(result) == 1:
         result = result[0]
     return result
 
